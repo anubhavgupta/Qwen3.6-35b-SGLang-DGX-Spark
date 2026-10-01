@@ -1,25 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# DFlash2 wrapper. We serve Qwen3.8-27B with the DFlash2 block-diffusion
-# draft instead of start.sh's EAGLE/MTP, by injecting EXTRA_ARGS (appended
-# last, argparse last-wins). The draft is pinned to DRAFT_MODEL@DRAFT_REVISION
-# (z-lab's DFlash2 draft; incoai/... is a mirror of the same weights).
+# DFlash2 wrapper. Serves the start.sh target (default
+# unsloth/Qwen3.6-35B-A3B-NVFP4, override with MODEL_ID) with the DFlash2
+# block-diffusion draft incoai/Qwen3.6-35B-A3B-DFlash2 (trained against
+# Qwen/Qwen3.6-35B-A3B; 6 sliding-window layers, block size 8, ~1 GB BF16),
+# by injecting the spec flags via EXTRA_ARGS (appended last, argparse
+# last-wins) and telling start.sh's pool math about the draft
+# (SPEC_DRAFT_TOKENS, DRAFT_KV_BYTES_PER_TOKEN, DRAFT_WEIGHTS_GIB).
+# The draft is pinned to DRAFT_MODEL@DRAFT_REVISION.
 # Image: an official multi-arch lmsysorg/sglang nightly from main (pinned
-# by its index digest, pulled from Docker Hub on first run — no git clone,
-# no local build). main carries DFlash2 (sglang #35371) and the quantized
-# target lm_head selector (#35496), so every DF_TARGET works, including the
-# packed-FP4 head, plus #35255 (zombie-request fix — see CHANGELOG
-# 2026-09-09). Override with IMAGE=<ref>; a locally present image is used
-# as-is. The self-built image machinery (patch/) was retired 2026-09-05;
-# commit 751e29e is the last one carrying it.
-# CRASH RULES (NVFP4): --mem-fraction-static 0.90 (0.95 hard-rebooted the
-# GB10 once at draft-graph capture, on the self-built image; the cookbook
-# pins 0.80 on GB10 because 0.85 trips DGX OS earlyoom). Default
-# DF_TARGET=nvfp4 is the BF16-lm_head export (dense head).
-# DFLASH requires --mamba-radix-cache-strategy extra_buffer on the image
-# this was validated on (extra_buffer_lazy was rejected); the official
-# image adds lazy support (#34763) but that is untested here.
+# by its index digest, pulled from Docker Hub on first run). It carries
+# DFlash2 (DFlash2DraftModel), Qwen3_5MoeForConditionalGeneration DFLASH
+# aux-hidden capture, and extra_buffer_lazy support for DFLASH verify
+# (#34763), so the target keeps start.sh's extra_buffer_lazy strategy
+# (set DF_MAMBA_STRATEGY=extra_buffer to fall back to the strategy the
+# 27B setup was validated with). Override with IMAGE=<ref>.
+# Memory: --mem-fraction-static comes from MEM_FRACTION_STATIC (start.sh
+# default 0.5). Never go above 0.90 on GB10: 0.95 hard-rebooted the box
+# once at draft-graph capture, and the cookbook pins 0.80 because 0.85
+# trips DGX OS earlyoom.
+# Draft KV: without a draft window the draft pool aliases the target's
+# token slots, costing 6 layers x 8 KV heads x 128 x 2 x 1 B (fp8, follows
+# --kv-cache-dtype) = 12 KB per token on top of the target's 10 KB.
+# DF_DRAFT_WINDOW=<n> (>= 8; the draft's own sliding window is 2048)
+# enables SGLang's compact draft KV cache, bounding draft KV per request.
+# DF_DRAFT_ATTN=<backend> overrides the draft attention backend (default:
+# the target's flashinfer). The model card uses fa4 (measured on GB300);
+# fa4 forces a BF16 draft KV (24 KB/token) and is untested on SM121.
+# YaRN: the draft inherits --json-model-override-args, so start.sh refuses
+# CONTEXT_LENGTH > 262144 while a draft is configured.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -27,8 +37,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HF_CACHE="${SCRIPT_DIR}/.cache/huggingface/hub"
 mkdir -p "${HF_CACHE}"
 
-DRAFT_MODEL="${DRAFT_MODEL:-z-lab/Qwen3.8-27B-DFlash2}"
-DRAFT_REVISION="${DRAFT_REVISION:-50307d4c4cde6860d4eee73e2547cd786fe8e8a4}"
+DRAFT_MODEL="${DRAFT_MODEL:-incoai/Qwen3.6-35B-A3B-DFlash2}"
+DRAFT_REVISION="${DRAFT_REVISION:-51ef7b6923ad6c14cb1bb41c37a9041446496ab6}"
 
 snapshot_present() {
   local base="${HF_CACHE}/models--${1//\//--}"
@@ -111,27 +121,41 @@ ensure_cached() {
 }
 ensure_cached "${DRAFT_MODEL}"
 
-DF_TARGET="${DF_TARGET:-nvfp4}"
-case "${DF_TARGET}" in
-  bf16) TARGET_PATH="Qwen/Qwen3.8-27B" ;;
-  nvfp4|nvfp4-bf16|nvfp4-bf16-head)
-        TARGET_PATH="RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead" ;;
-  nvfp4-fp4|nvfp4-fp4-head)
-        TARGET_PATH="RadixArk/Qwen3.8-27B-NVFP4" ;;
-  *) echo "DF_TARGET must be bf16, nvfp4, or nvfp4-fp4, got '${DF_TARGET}'"; exit 1 ;;
-esac
+DF_BLOCK_SIZE="${DF_BLOCK_SIZE:-8}"
+DF_DRAFT_WINDOW="${DF_DRAFT_WINDOW:-}"
+DF_DRAFT_ATTN="${DF_DRAFT_ATTN:-}"
+if ! [[ "${DF_BLOCK_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "DF_BLOCK_SIZE must be a positive integer, got '${DF_BLOCK_SIZE}'"; exit 1
+fi
 
-EXTRA_ARGS="--model-path ${TARGET_PATH} \
---speculative-algorithm DFLASH \
+EXTRA_ARGS="--speculative-algorithm DFLASH \
 --speculative-draft-model-path ${DRAFT_MODEL}${DRAFT_REVISION:+ --speculative-draft-model-revision ${DRAFT_REVISION}} \
---speculative-num-draft-tokens 8 \
---mamba-radix-cache-strategy extra_buffer"
-case "${DF_TARGET}" in
-  nvfp4|nvfp4-bf16|nvfp4-bf16-head|nvfp4-fp4|nvfp4-fp4-head)
-    EXTRA_ARGS+=" --mem-fraction-static 0.90" ;;
-esac
+--speculative-num-draft-tokens ${DF_BLOCK_SIZE}"
+
+# Draft KV bytes per target token: 6 layers x 2 (K,V) x 8 heads x 128 dim
+# x dtype bytes (fp8 = 1, follows --kv-cache-dtype; fa4 forces bf16 = 2).
+DRAFT_KV_DTYPE_BYTES=1
+if [[ -n "${DF_DRAFT_ATTN}" ]]; then
+  EXTRA_ARGS+=" --speculative-draft-attention-backend ${DF_DRAFT_ATTN}"
+  [[ "${DF_DRAFT_ATTN}" == "fa4" ]] && DRAFT_KV_DTYPE_BYTES=2
+fi
+DRAFT_KV_BYTES_PER_TOKEN=$(( 6 * 2 * 8 * 128 * DRAFT_KV_DTYPE_BYTES ))
+if [[ -n "${DF_DRAFT_WINDOW}" ]]; then
+  if ! [[ "${DF_DRAFT_WINDOW}" =~ ^[0-9]+$ ]] || (( DF_DRAFT_WINDOW < DF_BLOCK_SIZE )); then
+    echo "DF_DRAFT_WINDOW must be an integer >= DF_BLOCK_SIZE (${DF_BLOCK_SIZE}), got '${DF_DRAFT_WINDOW}'"; exit 1
+  fi
+  EXTRA_ARGS+=" --speculative-draft-window-size ${DF_DRAFT_WINDOW}"
+  # Compact cache: draft KV is bounded per request, not per target token.
+  DRAFT_KV_BYTES_PER_TOKEN=0
+fi
 EXTRA_ARGS+=" ${DF_EXTRA:-}"
 export EXTRA_ARGS
+
+export SPEC_LABEL="DFLASH ${DRAFT_MODEL} (block ${DF_BLOCK_SIZE}${DF_DRAFT_WINDOW:+, draft window ${DF_DRAFT_WINDOW}}${DF_DRAFT_ATTN:+, draft attn ${DF_DRAFT_ATTN}})"
+export SPEC_DRAFT_TOKENS="${DF_BLOCK_SIZE}"
+export DRAFT_KV_BYTES_PER_TOKEN
+export DRAFT_WEIGHTS_GIB="${DRAFT_WEIGHTS_GIB:-1.0}"
+export MAMBA_RADIX_STRATEGY="${DF_MAMBA_STRATEGY:-${MAMBA_RADIX_STRATEGY:-extra_buffer_lazy}}"
 
 echo "DFlash mode: EXTRA_ARGS=${EXTRA_ARGS}"
 echo "Delegating to ${SCRIPT_DIR}/start.sh"
