@@ -1,0 +1,27 @@
+# Ignore everything, except these tracked files
+*
+!start.sh
+!start-dspark.sh
+!stop.sh
+!README.md
+!CHANGELOG.md
+!.env.sample
+!LICENSE
+!.gitignore
+!bench/
+!bench/bench.sh
+!bench/ndec.py
+!bench/ab-image.sh
+# DFlash2 path (2026-08-19): serving script (the image is pulled from
+# Docker Hub since 2026-09-05; the patch/ builder lives at commit 751e29e)
+!start-dflash.sh
+# Decision records and plans, per file — analysis write-ups stay untracked
+!docs/
+!docs/brainstorms/
+!docs/brainstorms/*.md
+!docs/plans/
+!docs/plans/*.md
+# Deliberately NOT whitelisted: hybrid scripts (start-hybrid.sh,
+# start-mtp-8889.sh, hybrid-router.py) and analysis docs (DS4F/KIMI/GROK/
+# TIER_*). HANDOFF.md stays local — never un-ignore it.
+HANDOFF.md
