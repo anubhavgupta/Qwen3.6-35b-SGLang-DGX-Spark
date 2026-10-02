@@ -21,6 +21,8 @@ Script defaults in effect
   MAMBA_POOL_MODE          auto -> pinned 8 slots (2 x S=4)
   MAX_TOTAL_TOKENS         auto -> 524304 (2 x (262144 + 8))
   CPUSET                   5-9,15-19
+  SAMPLING_*               temperature 0.6, top_p 0.95, top_k 20, min_p 0.0,
+                           repetition_penalty 1.0 (server default; client values win)
 
 Image
 -----

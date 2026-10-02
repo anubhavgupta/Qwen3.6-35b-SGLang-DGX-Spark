@@ -37,7 +37,7 @@ curl http://127.0.0.1:8888/v1/chat/completions -H 'Content-Type: application/jso
 
 - **Thinking** is on by default; reasoning comes back in `reasoning_content`. Disable it per request with `"chat_template_kwargs": {"enable_thinking": false}`.
 - **Tool calling** works out of the box (`qwen3_coder` parser); just send `tools`.
-- **Sampling defaults** come from the model (temperature 1.0, top_p 0.95, top_k 20). The model card also recommends `presence_penalty: 1.5` for general chat.
+- **Default sampling** is temperature 0.6, top_p 0.95, top_k 20, min_p 0.0, presence_penalty 0.0, repetition_penalty 1.0 (the model card's "precise coding" profile). It applies only when a request omits a value; values your client sends always win. Change it with `SAMPLING_*` in `.env`.
 
 ## Configuration (`.env` or shell env)
 
@@ -49,6 +49,7 @@ curl http://127.0.0.1:8888/v1/chat/completions -H 'Content-Type: application/jso
 | `MODEL_ID` | `unsloth/Qwen3.6-35B-A3B-NVFP4` | Target checkpoint |
 | `MAX_TOTAL_TOKENS` | auto | KV cap. Default `N × (CONTEXT_LENGTH + draft tokens)`; `0` = use everything the fraction allows. |
 | `MAMBA_POOL_MODE` | `auto` | GDN state pool sizing: `pin` (N × 4 slots) or `ratio` (computed `--mamba-full-memory-ratio`) |
+| `SAMPLING_TEMPERATURE` / `_TOP_P` / `_TOP_K` / `_MIN_P` / `_REPETITION_PENALTY` | `0.6` / `0.95` / `20` / `0.0` / `1.0` | Server default sampling. Applied by mounting a patched `generation_config.json` into the container; the host cache isn't changed. |
 | `DF_BLOCK_SIZE` | `8` | DFlash draft tokens per step (8 measured best) |
 | `MTP_STEPS` / `MTP_DRAFT` | `3` / `4` | MTP chain length (3 measured best) |
 | `EXTRA_ARGS` | — | Extra SGLang flags, appended last |

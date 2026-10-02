@@ -101,6 +101,17 @@ CHUNKED_PREFILL="${CHUNKED_PREFILL:-8192}"
 # GDN state slot per running request; S 4 -> 3). 0 = stock locking.
 MAMBA_SKIP_DECODE_LOCK="${MAMBA_SKIP_DECODE_LOCK:-0}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.5}"
+# Server-side default sampling, used when a request omits a value (a value
+# sent by the client always wins). Defaults = the model card's "thinking
+# mode, precise coding" profile. SGLang reads defaults from the model's
+# generation_config.json (--sampling-defaults model); start.sh mounts a
+# patched copy over it inside the container (host HF cache untouched).
+# presence_penalty is not settable this way; SGLang's default is 0.0.
+SAMPLING_TEMPERATURE="${SAMPLING_TEMPERATURE:-0.6}"
+SAMPLING_TOP_P="${SAMPLING_TOP_P:-0.95}"
+SAMPLING_TOP_K="${SAMPLING_TOP_K:-20}"
+SAMPLING_MIN_P="${SAMPLING_MIN_P:-0.0}"
+SAMPLING_REPETITION_PENALTY="${SAMPLING_REPETITION_PENALTY:-1.0}"
 # GDN state-pool sizing (sglang compute-mamba-ratio skill), see header:
 #   auto  = pin when the concurrency cap binds or r* < 0.15, else ratio r*
 #   pin   = always --max-mamba-cache-size = concurrency x S
@@ -333,6 +344,37 @@ command -v curl >/dev/null 2>&1 || {
 
 mkdir -p "${HF_HOME}" "${TRITON_CACHE_DIR}"
 
+# Patched generation_config.json -> server default sampling (see SAMPLING_*).
+SAMPLING_MOUNT_ARGS=()
+SAMPLING_DESC="model generation_config (snapshot not cached yet; restart after first download to apply SAMPLING_*)"
+MODEL_CACHE_DIR="${HF_HOME}/hub/models--${MODEL_ID//\//--}"
+if [[ -f "${MODEL_CACHE_DIR}/refs/main" ]]; then
+  MODEL_SNAPSHOT="$(cat "${MODEL_CACHE_DIR}/refs/main")"
+  ORIG_GEN_CFG="${MODEL_CACHE_DIR}/snapshots/${MODEL_SNAPSHOT}/generation_config.json"
+  PATCHED_GEN_CFG="${WORK_DIR}/.cache/generation_config.patched.json"
+  if python3 - "${ORIG_GEN_CFG}" "${PATCHED_GEN_CFG}" <<PYEOF
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+try:
+    cfg = json.load(open(src))
+except FileNotFoundError:
+    cfg = {}
+cfg.update({"do_sample": True,
+            "temperature": float("${SAMPLING_TEMPERATURE}"),
+            "top_p": float("${SAMPLING_TOP_P}"),
+            "top_k": int("${SAMPLING_TOP_K}"),
+            "min_p": float("${SAMPLING_MIN_P}"),
+            "repetition_penalty": float("${SAMPLING_REPETITION_PENALTY}")})
+json.dump(cfg, open(dst, "w"), indent=2)
+PYEOF
+  then
+    SAMPLING_MOUNT_ARGS=(-v "${PATCHED_GEN_CFG}:/root/.cache/huggingface/hub/models--${MODEL_ID//\//--}/snapshots/${MODEL_SNAPSHOT}/generation_config.json:ro")
+    SAMPLING_DESC="temperature=${SAMPLING_TEMPERATURE} top_p=${SAMPLING_TOP_P} top_k=${SAMPLING_TOP_K} min_p=${SAMPLING_MIN_P} repetition_penalty=${SAMPLING_REPETITION_PENALTY} presence_penalty=0.0 (request values override)"
+  else
+    echo "warning: could not build patched generation_config.json; using the model's defaults"
+  fi
+fi
+
 # Pick up HF_TOKEN from ~/.bashrc (defined without `export` there) so the
 # container gets authenticated Hub access (higher rate limits, faster downloads).
 if [[ -z "${HF_TOKEN:-}" && -f "${HOME}/.bashrc" ]]; then
@@ -358,6 +400,7 @@ echo "Mamba pool: ${MAMBA_POOL_DESC}; r*=${MAMBA_RATIO} (token_equiv ${MAMBA_TOK
 echo "KV pool: ${KV_POOL_DESC}"
 echo "Spec decode: ${SPEC_LABEL}"
 echo "Image: ${IMAGE}"
+echo "Default sampling: ${SAMPLING_DESC}"
 echo "Served model name: ${SERVED_MODEL_NAME}"
 echo "Listening on ${HOST}:${PORT}"
 echo "Writing progress to ${LOG_FILE}"
@@ -386,6 +429,7 @@ docker run -d \
   "${DOCKER_ENV_ARGS[@]}" \
   "${ALLOW_LONGER_ARGS[@]}" \
   -v "${HF_HOME}:/root/.cache/huggingface" \
+  "${SAMPLING_MOUNT_ARGS[@]}" \
   -v "${TRITON_CACHE_DIR}:/root/.triton" \
   "${IMAGE}" \
   python3 -m sglang.launch_server \
