@@ -1,0 +1,163 @@
+Best known config — Qwen3.6-35B-A3B NVFP4 + DFlash2 on DGX Spark (GB10)
+======================================================================
+Recorded: 2026-10-02 (DFlash block 8 confirmed best by the sweep below)
+
+How to launch
+-------------
+  ./stop.sh
+  ./start-dflash.sh          # with .env: MAX_CONCURRENT_REQUESTS=2, CONTEXT_LENGTH=262144, YARN=0
+
+Script defaults in effect
+-------------------------
+  MODEL_ID                 unsloth/Qwen3.6-35B-A3B-NVFP4
+  DRAFT_MODEL              incoai/Qwen3.6-35B-A3B-DFlash2 @ 51ef7b6923ad6c14cb1bb41c37a9041446496ab6
+  DF_BLOCK_SIZE            8
+  DF_DRAFT_WINDOW          (unset -> no compact draft KV)
+  DF_DRAFT_ATTN            (unset -> flashinfer, same as target)
+  MAMBA_RADIX_STRATEGY     extra_buffer_lazy
+  MEM_FRACTION_STATIC      0.5
+  MAX_CONCURRENT_REQUESTS  2
+  CONTEXT_LENGTH           262144
+  MAMBA_POOL_MODE          auto -> pinned 8 slots (2 x S=4)
+  MAX_TOTAL_TOKENS         auto -> 524304 (2 x (262144 + 8))
+  CPUSET                   5-9,15-19
+
+Image
+-----
+  lmsysorg/sglang@sha256:00205b89f74691f76a0ffbd6846376d9323971930a5d59bf63a65dadc7d67927
+  (= lmsysorg/sglang:nightly-cu134-20260909-708f51e). Required: the older
+  lmsysorg/sglang:qwen38-27b drops the FP8 lm_head scales of this checkpoint
+  and the output collapses into one repeated word.
+
+Effective server command (inside the container)
+-----------------------------------------------
+python3 -m sglang.launch_server \
+  --model-path unsloth/Qwen3.6-35B-A3B-NVFP4 \
+  --served-model-name qwen3.6-35b-a3b-sglang \
+  --trust-remote-code \
+  --mem-fraction-static 0.5 \
+  --sleep-on-idle \
+  --attention-backend flashinfer \
+  --chunked-prefill-size 8192 \
+  --disable-prefill-cuda-graph \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-ssm-dtype bfloat16 \
+  --mamba-radix-cache-strategy extra_buffer_lazy \
+  --max-mamba-cache-size 8 \
+  --max-total-tokens 524304 \
+  --max-running-requests 2 \
+  --context-length 262144 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder \
+  --sampling-defaults model \
+  --enable-metrics \
+  --enable-cache-report \
+  --host 0.0.0.0 --port 8888 \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path incoai/Qwen3.6-35B-A3B-DFlash2 \
+  --speculative-draft-model-revision 51ef7b6923ad6c14cb1bb41c37a9041446496ab6 \
+  --speculative-num-draft-tokens 8
+
+Container env: HF_HOME=/root/.cache/huggingface, TRITON_CACHE_DIR=/root/.triton,
+SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=0; docker run --network host --ipc host
+--privileged --gpus all --shm-size 32g --cpuset-cpus 5-9,15-19.
+
+Memory (from .sglang.log)
+-------------------------
+  target weights 24.46 GB, draft weights 1.18 GB
+  mamba state 0.27 GB (8 slots + padding) + 0.70 GB DFlash intermediate states
+  target KV 5.0 GB + draft KV 6.0 GB (524304 tokens; 10 KB + 12 KB per token)
+  free after startup: ~69 GB
+
+DFlash sweep results (2026-10-02)
+---------------------------------
+Harness: each config booted fresh with the settings above (only the listed
+knob changed); warmup, then concurrency 1 = 4 prompts x 2 runs, default
+sampling (temp 1.0, top_p 0.95, top_k 20), max_tokens 1024, non-streaming:
+  reason  bat-and-ball puzzle, thinking on
+  chat    "Explain how a refrigerator works", thinking on
+  code    Python LRU cache class, thinking off
+  essay   500-word printing-press essay, thinking off
+c=2 = code + essay sent together, 2 rounds, aggregate output tok/s.
+accept len = generated tokens / spec verify calls over the c=1 phase
+(includes the bonus token). Speeds in output tok/s (wall time incl. prefill).
+
+| Config                 | c=1 mean | reason | chat | code  | essay | c=2 agg | accept len | issues          |
+|------------------------|---------:|-------:|-----:|------:|------:|--------:|-----------:|-----------------|
+| no spec (start.sh)     |     66.7 |   66.4 | 67.0 |  66.6 |  66.6 |    94.0 |          - | none            |
+| DFlash block 4         |     76.3 |   89.4 | 66.3 |  89.0 |  60.6 |   114.9 |       2.95 | none            |
+| DFlash block 6         |    103.8 |  137.1 | 81.9 | 130.2 |  66.2 |   114.1 |       3.61 | reason check*   |
+| DFlash block 8  (BEST) |    120.1 |  154.8 | 85.9 | 162.7 |  77.1 |   149.8 |       3.85 | none            |
+| DFlash block 10        |    113.3 |  140.9 | 79.8 | 163.7 |  68.8 |   139.2 |       4.07 | none            |
+| DFlash block 12        |    120.5 |  172.5 | 80.8 | 160.3 |  68.3 |   126.8 |       4.20 | none            |
+| DFlash block 16        |    114.8 |  158.1 | 77.7 | 162.9 |  60.4 |   123.0 |       4.27 | none            |
+| DFlash block 8 + fa4   |    120.8 |  156.3 | 89.6 | 161.5 |  75.8 |   145.5 |       3.84 | none            |
+| MTP 3 steps (draft 4)  |     86.3 |   91.5 | 74.2 | 104.0 |  75.6 |   131.8 |       2.93 | none            |
+| MTP 6 steps (draft 7)  |     85.1 |  104.3 | 66.7 | 109.7 |  59.6 |   116.1 |       3.67 | reason check*   |
+| MTP 8 steps (draft 9)  |     75.4 |   94.2 | 57.0 | 101.9 |  48.7 |    95.6 |       3.86 | reason check*   |
+
+* "reason check" = the answer checker (looks for "0.05" / "5 cents" in the
+  final content) missed once at temp 1.0. DFlash and EAGLE/MTP verification
+  are lossless, so this is a sampling/phrasing miss or a thinking trace that
+  hit max_tokens=1024 before the answer, not a spec-decode fault.
+
+Concurrency 10 (MAX_CONCURRENT_REQUESTS=10, MEM_FRACTION_STATIC=0.5)
+--------------------------------------------------------------------
+10 requests at once (the 4 prompts above round-robin), 2 rounds,
+max_tokens 1024. At 0.5 the KV budget fits only ~5 full 262K requests;
+irrelevant for these short prompts, but raise MEM_FRACTION_STATIC (~0.72)
+if 10 long-context requests must run at once.
+
+| Config                 | aggregate | per-req mean | per-req min | accept len |
+|------------------------|----------:|-------------:|------------:|-----------:|
+| no spec (start.sh)     |     223.9 |         26.4 |        25.8 |          - |
+| DFlash block 8         |     308.1 |         44.5 |        22.5 |       3.87 |
+
+  DFlash still wins at c=10: 1.38x aggregate, 1.7x mean per-request speed.
+  The slowest requests (essay/chat prose, low acceptance) are ~13% slower
+  than no-spec, because every request in the batch pays the 8-token
+  verify cost.
+
+KV capacity by --mem-fraction-static (boot-log measured, KV cap off)
+--------------------------------------------------------------------
+Full context = 262144 tokens. Measured with MAX_TOTAL_TOKENS=0 so SGLang
+sizes KV from the whole fraction (boot only, no load test).
+
+| Fraction | Mode            | max_total_num_tokens | full contexts | free after boot |
+|---------:|-----------------|---------------------:|--------------:|----------------:|
+|     0.50 | DFlash block 8  |            1,225,770 |           4.7 |        ~52 GB   |
+|     0.90 | DFlash block 8  |            3,357,023 |          12.8 |         ~7 GB   |
+|     0.90 | no spec         |            7,544,800 |          28.8 |        ~11 GB   |
+|     0.93 | DFlash block 8  |            3,506,760 |          13.4 |         ~8 GB   |
+|     0.93 | no spec         |            7,881,624 |          30.1 |       ~10.5 GB  |
+|     0.95 | DFlash block 8  |            3,605,460 |         13.75 |  ~5.4 GB (4.9 GB swapped) |
+|     0.95 | no spec         |            8,209,240 |          31.3 |        ~4.5 GB  |
+
+  DFlash costs 22 KB of KV per token (10 target + 12 draft) vs 10 KB
+  without a draft, so it fits ~2.25x fewer full contexts at the same
+  fraction. Rule of thumb from the two DFlash points: ~2.4 full DFlash
+  contexts per +0.1 of fraction (0.8 ~ 10.4, 0.7 ~ 8).
+  0.9 leaves only 7-11 GB for the OS, page cache and runtime buffers on
+  GB10's shared memory: fine to boot, risky under long-context load.
+  Keep <= 0.80 for real use.
+
+Takeaways
+  - Block 8 (the draft's trained block_size) is the best all-rounder:
+    1.8x no-spec at c=1, 1.6x at c=2, and the best c=2 throughput.
+  - Gains are workload-dependent: ~2.3-2.4x on reasoning/code, only
+    ~1.15-1.3x on open-ended chat/essay prose.
+  - Blocks > 8 raise accept length slightly (4.07-4.27) but the wider
+    verify step costs more than it saves: c=1 flat-to-worse (block 12's
+    reason number is one noisy sample), c=2 clearly worse (127-139).
+  - Blocks < 8 lose across the board; block 4 is slower than no-spec on
+    essays.
+  - fa4 draft attention works on SM121 but is within noise of flashinfer
+    and forces a BF16 draft KV (24 KB/token vs 12 KB), so it is not used.
+  - MTP (./start-mtp.sh, in-checkpoint head, EAGLE topk 1) peaks at 3
+    steps: 1.3x no-spec at c=1, 1.4x at c=2 -- well behind DFlash block 8
+    on reasoning/code (91-104 vs 155-163 tok/s), roughly tied on essay
+    prose. More steps raise accept length (2.93 -> 3.86) but each MTP step
+    is a sequential draft forward, so 6/8 steps lose speed (8 steps is
+    slower than no-spec on chat/essay and at c=2). Use MTP only if DFlash
+    is unavailable (e.g. YaRN > 262K context, which DFlash refuses).
+  - c=1 differences under ~5% are within run-to-run noise (temp 1.0).

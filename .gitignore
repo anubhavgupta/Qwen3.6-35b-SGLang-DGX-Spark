@@ -15,6 +15,10 @@
 # DFlash2 path (2026-08-19): serving script (the image is pulled from
 # Docker Hub since 2026-09-05; the patch/ builder lives at commit 751e29e)
 !start-dflash.sh
+!start-mtp.sh
+# Benchmark results and the recommended config
+!numbers.md
+!best-config.txt
 # Decision records and plans, per file — analysis write-ups stay untracked
 !docs/
 !docs/brainstorms/

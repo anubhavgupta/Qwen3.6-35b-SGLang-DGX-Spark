@@ -63,7 +63,7 @@ set -euo pipefail
 #     scheduler cap to match. After boot, check the "Mamba Cache is
 #     allocated" / "KV Cache is allocated" / max_running_requests lines
 #     in .sglang.log to confirm the byte constants above.
-#   - Context: YARN=0|1 in .env, plus CONTEXT_LENGTH (range 262144..1000000;
+#   - Context: YARN=0|1 in .env, plus CONTEXT_LENGTH (range 1024..1000000;
 #     the card validates up to 1,010,000). YaRN (rope scaling) is applied
 #     when CONTEXT_LENGTH exceeds 262144 and either YARN=1 or the length
 #     is exactly 1000000. Factor = round(CONTEXT_LENGTH/262144) ->
@@ -168,8 +168,8 @@ if [[ -n "${DOCKER_ENV:-}" ]]; then
     DOCKER_ENV_ARGS+=(-e "${_pair}")
   done
 fi
-if (( CONTEXT_LENGTH < 262144 || CONTEXT_LENGTH > 1000000 )); then
-  echo "CONTEXT_LENGTH '${CONTEXT_LENGTH}' unsupported (use 262144..1000000)"; exit 1
+if (( CONTEXT_LENGTH < 1024 || CONTEXT_LENGTH > 1000000 )); then
+  echo "CONTEXT_LENGTH '${CONTEXT_LENGTH}' unsupported (use 1024..1000000)"; exit 1
 fi
 case "${YARN}" in
   0|1) : ;;
