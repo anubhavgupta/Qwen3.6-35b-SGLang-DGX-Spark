@@ -16,6 +16,9 @@
 # Docker Hub since 2026-09-05; the patch/ builder lives at commit 751e29e)
 !start-dflash.sh
 !start-mtp.sh
+# SGLang patches applied at container start (start.sh)
+!patches/
+!patches/*.patch
 # Benchmark results and the recommended config
 !numbers.md
 !best-config.txt

@@ -1,0 +1,51 @@
+Server-default presence_penalty for /v1/chat/completions (SGLang nightly-cu134-20260909-708f51e).
+
+Qwen3.6's model card recommends presence_penalty=1.5 for thinking mode on general tasks, but SGLang can't apply it
+as a server default: --sampling-defaults model reads only temperature, top_p, top_k, min_p and repetition_penalty
+from generation_config.json, and ChatCompletionRequest.presence_penalty defaults to 0.0, so the request always
+"sets" it. With this patch the chat request's presence_penalty defaults to None and falls back to
+generation_config.json's presence_penalty (then 0.0), as temperature and the others already do; a value the client
+sends still wins. start.sh writes SAMPLING_PRESENCE_PENALTY into the mounted generation_config.json.
+Applied with `patch -p1` in /sgl-workspace/sglang/python at container start (start.sh).
+
+diff -ru a/sglang/srt/configs/model_config.py b/sglang/srt/configs/model_config.py
+--- a/sglang/srt/configs/model_config.py	2026-10-28 18:08:57.144442669 +0530
++++ b/sglang/srt/configs/model_config.py	2026-10-28 18:09:12.082509042 +0530
+@@ -1878,6 +1878,7 @@
+             "top_k",
+             "top_p",
+             "min_p",
++            "presence_penalty",
+         ]
+ 
+         default_sampling_params = {
+diff -ru a/sglang/srt/entrypoints/openai/protocol.py b/sglang/srt/entrypoints/openai/protocol.py
+--- a/sglang/srt/entrypoints/openai/protocol.py	2026-10-28 18:08:57.139547875 +0530
++++ b/sglang/srt/entrypoints/openai/protocol.py	2026-10-28 18:09:12.082274097 +0530
+@@ -863,7 +863,8 @@
+         "including visible output tokens and reasoning tokens. Input tokens are not included. ",
+     )
+     n: int = 1
+-    presence_penalty: float = 0.0
++    # None: the server default (--sampling-defaults model: generation_config.json's presence_penalty), else 0.0
++    presence_penalty: Optional[float] = None
+     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
+     seed: Optional[int] = None
+     stop: Optional[Union[str, List[str]]] = None
+@@ -976,6 +977,7 @@
+         "top_k": -1,
+         "min_p": 0.0,
+         "repetition_penalty": 1.0,
++        "presence_penalty": 0.0,
+     }
+ 
+     @model_validator(mode="before")
+@@ -1129,7 +1131,7 @@
+             "top_p": get_param("top_p"),
+             "top_k": get_param("top_k"),
+             "min_p": get_param("min_p"),
+-            "presence_penalty": self.presence_penalty,
++            "presence_penalty": get_param("presence_penalty"),
+             "frequency_penalty": self.frequency_penalty,
+             "repetition_penalty": get_param("repetition_penalty"),
+             "regex": self.regex,

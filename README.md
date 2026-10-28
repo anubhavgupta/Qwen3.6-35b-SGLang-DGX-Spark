@@ -35,9 +35,9 @@ curl http://127.0.0.1:8888/v1/chat/completions -H 'Content-Type: application/jso
 }'
 ```
 
-- **Thinking** is on by default; reasoning comes back in `reasoning_content`. Disable it per request with `"chat_template_kwargs": {"enable_thinking": false}`.
+- **Thinking** is on by default; reasoning comes back in `reasoning_content`. `preserve_thinking` is on by default too: the reasoning of earlier assistant turns is kept in the prompt, as the model card recommends for agents (`CHAT_TEMPLATE_KWARGS` in `.env`). Disable it per request with `"chat_template_kwargs": {"enable_thinking": false}`.
 - **Tool calling** works out of the box (`qwen3_coder` parser); just send `tools`.
-- **Default sampling** is temperature 0.6, top_p 0.95, top_k 20, min_p 0.0, presence_penalty 0.0, repetition_penalty 1.0 (the model card's "precise coding" profile). It applies only when a request omits a value; values your client sends always win. Change it with `SAMPLING_*` in `.env`.
+- **Default sampling** is temperature 1.0, top_p 0.95, top_k 20, min_p 0.0, presence_penalty 1.5, repetition_penalty 1.0: the model card's "thinking mode for general tasks" profile, the right one for agents such as pi. It applies only when a request omits a value; values your client sends always win. Change it with `SAMPLING_*` in `.env` (the card's "precise coding" profile is `SAMPLING_TEMPERATURE=0.6 SAMPLING_PRESENCE_PENALTY=0`). The server default `presence_penalty` and penalties under DFlash need the SGLang patches in `patches/` (see [SGLang patches](#sglang-patches)).
 
 ## Configuration (`.env` or shell env)
 
@@ -49,13 +49,40 @@ curl http://127.0.0.1:8888/v1/chat/completions -H 'Content-Type: application/jso
 | `MODEL_ID` | `unsloth/Qwen3.6-35B-A3B-NVFP4` | Target checkpoint |
 | `MAX_TOTAL_TOKENS` | auto | KV cap. Default `N × (CONTEXT_LENGTH + draft tokens)`; `0` = use everything the fraction allows. |
 | `MAMBA_POOL_MODE` | `auto` | GDN state pool sizing: `pin` (N × 4 slots) or `ratio` (computed `--mamba-full-memory-ratio`) |
-| `SAMPLING_TEMPERATURE` / `_TOP_P` / `_TOP_K` / `_MIN_P` / `_REPETITION_PENALTY` | `0.6` / `0.95` / `20` / `0.0` / `1.0` | Server default sampling. Applied by mounting a patched `generation_config.json` into the container; the host cache isn't changed. |
+| `SAMPLING_TEMPERATURE` / `_TOP_P` / `_TOP_K` / `_MIN_P` / `_PRESENCE_PENALTY` / `_REPETITION_PENALTY` | `1.0` / `0.95` / `20` / `0.0` / `1.5` / `1.0` | Server default sampling (model card, thinking mode, general tasks). Applied by mounting a patched `generation_config.json` into the container; the host cache isn't changed. |
+| `CHAT_TEMPLATE_KWARGS` | `{"preserve_thinking": true}` | Server default chat-template kwargs; keys the client sends win |
 | `DF_BLOCK_SIZE` | `8` | DFlash draft tokens per step (8 measured best) |
 | `MTP_STEPS` / `MTP_DRAFT` | `3` / `4` | MTP chain length (3 measured best) |
 | `EXTRA_ARGS` | — | Extra SGLang flags, appended last |
 | `DOCKER_ENV` | — | Extra container env, e.g. `SGLANG_FLASHINFER_WORKSPACE_SIZE=1073741824` (needed for spec modes above ~150 streams) |
 
 On every start, the script prints the derived state pool and KV cache sizes, and warns if `MAX_CONCURRENT_REQUESTS × CONTEXT_LENGTH` won't fit in the memory budget.
+
+## SGLang patches
+
+`start.sh` applies `patches/*.patch` to SGLang's Python tree (`patch -p1` in `/sgl-workspace/sglang/python`) when
+the container starts; the image is unchanged. They target the pinned image below.
+
+| Patch | Why |
+|---|---|
+| `0001-chat-presence-penalty-default` | SGLang reads only temperature, top_p, top_k, min_p and repetition_penalty from `generation_config.json`, and a chat request's `presence_penalty` always defaults to 0.0, so the card's `presence_penalty=1.5` could not be a server default. Now an omitted `presence_penalty` falls back to `generation_config.json` (`SAMPLING_PRESENCE_PENALTY`); a client value still wins |
+| `0002-dflash-penalties` | **Bug fix:** DFlash never fed generated tokens to the penalizers (EAGLE does; `prepare_for_decode` skips it for speculative batches). Each DFlash decode step now feeds every token each request committed since its last step |
+| `0003-dflash-verify-penalties` | **Bug fix:** DFlash's verify read the penalties under an old name (`acc_linear_penalties`) that overlap scheduling no longer sets, so no penalty reached any verify row. It now applies `acc_additive_penalties` (presence, frequency) and `acc_scaling_penalties` (repetition) |
+
+Before 0002 and 0003, `presence_penalty`, `frequency_penalty` and `repetition_penalty` had **no effect** with
+`./start-dflash.sh`: greedy replies with `presence_penalty` 0 and 1.5 were byte-identical (`./start.sh` honoured
+them). Now an omitted `presence_penalty` gives the same reply as an explicit 1.5, 0 still gives the old reply, and
+`repetition_penalty` 1.3 changes the reply. Tool calls (streamed and not, parallel, multi-turn) pass. Speed under
+DFlash, 512-token replies, thinking off, default sampling (temperature 1.0): one stream 104-105 tok/s with the
+default penalty vs 102-108 with `presence_penalty: 0`; four streams 190-195 vs 203-204 tok/s total (~5% for the
+penalty work). Temperature 1.0 also accepts fewer draft tokens than 0.6, so expect lower DFlash numbers than the
+0.6-sampled tables below.
+
+Quantization was checked too, with no change made. Unsloth's export runs its NVFP4 experts W4A4 (activations
+quantized to FP4). NVIDIA's `nvidia/Qwen3.6-35B-A3B-NVFP4` (W4A16 experts) was served on the same image
+(`--moe-runner-backend marlin`, true bf16 activations; and `flashinfer_cutlass`). Teacher-forced NLL on four fixed
+texts and greedy GSM8K (200 problems) came out level: Unsloth 96.0%, NVIDIA cutlass 96.5%, NVIDIA Marlin 97.5%,
+with NLL within 1% and Unsloth's lowest.
 
 ## Image
 
@@ -122,6 +149,7 @@ GB10's GPU and OS share one memory pool, and **GPU allocations can't be swapped*
 | `start.sh` | Main launcher (no spec); holds all the pool-sizing logic |
 | `start-dflash.sh` / `start-mtp.sh` | Thin wrappers that add the speculative-decoding flags, then call `start.sh` |
 | `stop.sh` | Stops the container (idempotent) |
+| `patches/` | SGLang patches applied at container start (server-default `presence_penalty`, DFlash penalty fixes) |
 | `.env.sample` | All settings, documented |
 | `best-config.txt` | Best known launch config with the exact server command |
 | `numbers.md` | All measurements: memory constants, sweeps, capacity, crash notes |

@@ -1,0 +1,72 @@
+DFlash verify: apply the batch's precomputed penalties (SGLang nightly-cu134-20260909-708f51e, speculative/dflash_utils.py).
+
+Under overlap scheduling (the default) SamplingBatchInfo.copy_for_forward precomputes the penalties as
+acc_additive_penalties (presence, frequency) and acc_scaling_penalties (repetition) and drops the orchestrator.
+apply_dflash_verify_logits_adjustments still looked for the older name acc_linear_penalties, found nothing, and
+applied no penalty to any verify row: with ./start-dflash.sh every presence/frequency/repetition penalty was a
+no-op. This reads the current names, applies the repetition scaling over the block too (as
+apply_scaling_penalties does), and without overlap takes both from the live penalizers.
+Needs 0002 (the penalizers must see the generated tokens). Verified: greedy presence_penalty 0 vs 1.5 differ under
+DFlash, the server default equals an explicit 1.5, tool calls and reasoning unaffected.
+
+diff -ru a/sglang/srt/speculative/dflash_utils.py b/sglang/srt/speculative/dflash_utils.py
+--- a/sglang/srt/speculative/dflash_utils.py	2026-10-28 18:29:30.399314510 +0530
++++ b/sglang/srt/speculative/dflash_utils.py	2026-10-28 18:29:30.518877112 +0530
+@@ -241,7 +241,14 @@
+             num_tokens_in_batch=draft_token_num,
+         )
+ 
++    # Overlap scheduling precomputes the penalties (SamplingBatchInfo.copy_for_forward ->
++    # update_penalties) as acc_additive_penalties and acc_scaling_penalties and drops the
++    # orchestrator; acc_linear_penalties is the older name. Reading only that name left
++    # presence/frequency/repetition penalties out of every DFlash verify.
+     acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
++    if acc_linear_penalties is None:
++        acc_linear_penalties = getattr(sampling_info, "acc_additive_penalties", None)
++    acc_scaling_penalties = getattr(sampling_info, "acc_scaling_penalties", None)
+     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+     grammar_mask = getattr(sampling_info, "grammar_mask", None)
+     logit_bias = getattr(sampling_info, "logit_bias", None)
+@@ -254,9 +261,15 @@
+             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
+         return logits_3d
+ 
++    def apply_scaling(scaling: Optional[torch.Tensor]) -> None:
++        # repetition penalty, as apply_scaling_penalties does, over every row of the block
++        if scaling is None:
++            return
++        s = scaling[:, None, :].to(device=next_token_logits.device, dtype=next_token_logits.dtype)
++        l3 = get_logits_3d()
++        l3.copy_(torch.where(l3 < 0, l3 * s, l3 / s))
++
+     # Dense fallback only when we need live penalizer application or a vocab mask.
+-    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
+-    # broadcast over the verify block without materializing a repeated buffer.
+     if (
+         penalizer is not None and penalizer.is_required and acc_linear_penalties is None
+     ) or grammar_mask is not None:
+@@ -265,10 +278,16 @@
+             dtype=torch.float32,
+             device=next_token_logits.device,
+         )
++        live = penalizer is not None and penalizer.is_required and acc_linear_penalties is None
++        if live:
++            # no precomputed penalties (no overlap): take them from the penalizers
++            penalizer.accumulate_additive_penalties(linear_penalty)
++            acc_scaling_penalties = penalizer.accumulate_scaling_penalties()
+         sampling_info.apply_logits_bias(linear_penalty)
+         get_logits_3d().add_(
+             linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
+         )
++        apply_scaling(acc_scaling_penalties)
+         return
+ 
+     if acc_linear_penalties is not None:
+@@ -281,6 +300,7 @@
+                 dtype=next_token_logits.dtype,
+             )
+         get_logits_3d().add_(acc_linear_penalties[:, None, :])
++    apply_scaling(acc_scaling_penalties)
+ 
+     if logit_bias is not None:
+         if (

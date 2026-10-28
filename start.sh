@@ -34,9 +34,9 @@ set -euo pipefail
 #         top_p=0.8, presence_penalty=1.5 per card).
 #       * --sampling-defaults model (SGLang default, pinned):
 #         defaults come from the checkpoint's generation_config.json
-#         (temperature=1.0, top_p=0.95, top_k=20). The card also
-#         recommends presence_penalty=1.5 for general thinking tasks;
-#         send it per request.
+#         (temperature=1.0, top_p=0.95, top_k=20), overridden by
+#         SAMPLING_* below (default: the card's general thinking profile,
+#         presence_penalty=1.5 included, via patches/0001).
 #       * Tool calling: --tool-call-parser qwen3_coder decodes the
 #         template's <tool_call><function=...>/<parameter=...>
 #         payload into structured tool_calls. SGLang needs no
@@ -103,15 +103,26 @@ MAMBA_SKIP_DECODE_LOCK="${MAMBA_SKIP_DECODE_LOCK:-0}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.5}"
 # Server-side default sampling, used when a request omits a value (a value
 # sent by the client always wins). Defaults = the model card's "thinking
-# mode, precise coding" profile. SGLang reads defaults from the model's
-# generation_config.json (--sampling-defaults model); start.sh mounts a
-# patched copy over it inside the container (host HF cache untouched).
-# presence_penalty is not settable this way; SGLang's default is 0.0.
-SAMPLING_TEMPERATURE="${SAMPLING_TEMPERATURE:-0.6}"
+# mode for general tasks" profile (temperature 1.0, top_p 0.95, top_k 20,
+# min_p 0, presence_penalty 1.5, repetition_penalty 1.0); its "precise
+# coding" profile is SAMPLING_TEMPERATURE=0.6 SAMPLING_PRESENCE_PENALTY=0.
+# SGLang reads defaults from the model's generation_config.json
+# (--sampling-defaults model); start.sh mounts a patched copy over it inside
+# the container (host HF cache untouched). presence_penalty is read from it
+# only with patches/0001 (stock SGLang fixes the chat default at 0.0).
+SAMPLING_TEMPERATURE="${SAMPLING_TEMPERATURE:-1.0}"
 SAMPLING_TOP_P="${SAMPLING_TOP_P:-0.95}"
 SAMPLING_TOP_K="${SAMPLING_TOP_K:-20}"
 SAMPLING_MIN_P="${SAMPLING_MIN_P:-0.0}"
 SAMPLING_REPETITION_PENALTY="${SAMPLING_REPETITION_PENALTY:-1.0}"
+SAMPLING_PRESENCE_PENALTY="${SAMPLING_PRESENCE_PENALTY:-1.5}"
+# Server default chat-template kwargs (JSON), merged into every request;
+# keys the client sends itself win. preserve_thinking=true makes the Qwen3.6
+# template keep the reasoning of ALL past assistant turns (otherwise only
+# turns after the last user message keep it), as the model card recommends
+# for agents; it also keeps the history byte-identical across turns, so the
+# prefix cache keeps hitting.
+CHAT_TEMPLATE_KWARGS="${CHAT_TEMPLATE_KWARGS:-{\"preserve_thinking\": true\}}"
 # GDN state-pool sizing (sglang compute-mamba-ratio skill), see header:
 #   auto  = pin when the concurrency cap binds or r* < 0.15, else ratio r*
 #   pin   = always --max-mamba-cache-size = concurrency x S
@@ -364,12 +375,13 @@ cfg.update({"do_sample": True,
             "top_p": float("${SAMPLING_TOP_P}"),
             "top_k": int("${SAMPLING_TOP_K}"),
             "min_p": float("${SAMPLING_MIN_P}"),
-            "repetition_penalty": float("${SAMPLING_REPETITION_PENALTY}")})
+            "repetition_penalty": float("${SAMPLING_REPETITION_PENALTY}"),
+            "presence_penalty": float("${SAMPLING_PRESENCE_PENALTY}")})
 json.dump(cfg, open(dst, "w"), indent=2)
 PYEOF
   then
     SAMPLING_MOUNT_ARGS=(-v "${PATCHED_GEN_CFG}:/root/.cache/huggingface/hub/models--${MODEL_ID//\//--}/snapshots/${MODEL_SNAPSHOT}/generation_config.json:ro")
-    SAMPLING_DESC="temperature=${SAMPLING_TEMPERATURE} top_p=${SAMPLING_TOP_P} top_k=${SAMPLING_TOP_K} min_p=${SAMPLING_MIN_P} repetition_penalty=${SAMPLING_REPETITION_PENALTY} presence_penalty=0.0 (request values override)"
+    SAMPLING_DESC="temperature=${SAMPLING_TEMPERATURE} top_p=${SAMPLING_TOP_P} top_k=${SAMPLING_TOP_K} min_p=${SAMPLING_MIN_P} repetition_penalty=${SAMPLING_REPETITION_PENALTY} presence_penalty=${SAMPLING_PRESENCE_PENALTY} (request values override)"
   else
     echo "warning: could not build patched generation_config.json; using the model's defaults"
   fi
@@ -401,6 +413,7 @@ echo "KV pool: ${KV_POOL_DESC}"
 echo "Spec decode: ${SPEC_LABEL}"
 echo "Image: ${IMAGE}"
 echo "Default sampling: ${SAMPLING_DESC}"
+echo "Default chat template kwargs: ${CHAT_TEMPLATE_KWARGS}"
 echo "Served model name: ${SERVED_MODEL_NAME}"
 echo "Listening on ${HOST}:${PORT}"
 echo "Writing progress to ${LOG_FILE}"
@@ -431,8 +444,10 @@ docker run -d \
   -v "${HF_HOME}:/root/.cache/huggingface" \
   "${SAMPLING_MOUNT_ARGS[@]}" \
   -v "${TRITON_CACHE_DIR}:/root/.triton" \
+  -v "${SCRIPT_DIR}/patches:/patches:ro" \
+  --entrypoint bash \
   "${IMAGE}" \
-  python3 -m sglang.launch_server \
+  -c 'cd /sgl-workspace/sglang/python && for p in /patches/*.patch; do [ -f "$p" ] || continue; echo "applying $p"; patch -p1 -s --forward < "$p" || exit 1; done && exec python3 -m sglang.launch_server "$@"' bash \
   --model-path "${MODEL_ID}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
   --trust-remote-code \
@@ -450,6 +465,7 @@ docker run -d \
   "${CONTEXT_ARGS[@]}" \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
+  --default-chat-template-kwargs "${CHAT_TEMPLATE_KWARGS}" \
   --sampling-defaults model \
   --enable-metrics \
   --enable-cache-report \

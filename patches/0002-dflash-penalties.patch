@@ -1,0 +1,79 @@
+DFlash: feed generated tokens to the penalizers (SGLang nightly-cu134-20260909-708f51e, speculative/spec_utils.py).
+
+ScheduleBatch.prepare_for_decode returns before cumulate_penalty_output_tokens() for speculative batches. EAGLE
+calls it itself (feeding the last token a step); DFlash never did, so with ./start-dflash.sh presence_penalty,
+frequency_penalty and repetition_penalty never saw a generated token and had no effect: greedy replies with
+presence_penalty 0 and 1.5 were byte-identical (with ./start.sh they differ). This feeds, at each DFlash decode
+prep, every output token a request gained since its previous step (up to a block), one position at a time:
+presence/repetition (set-based) pad shorter requests with their last token (idempotent), frequency/min_new_tokens
+(count-based) add only real tokens. Under overlap scheduling the newest tokens arrive a step later, as for EAGLE.
+Verified: greedy presence_penalty 0 vs 1.5 now differ under DFlash, and the default equals an explicit 1.5.
+
+diff -ru a/sglang/srt/speculative/spec_utils.py b/sglang/srt/speculative/spec_utils.py
+--- a/sglang/srt/speculative/spec_utils.py	2026-10-28 18:24:36.211647848 +0530
++++ b/sglang/srt/speculative/spec_utils.py	2026-10-28 18:24:36.309237964 +0530
+@@ -1078,6 +1078,56 @@
+             )
+ 
+ 
++def _dflash_cumulate_penalties(batch: ScheduleBatch) -> None:
++    """Feed the penalizers every token each request emitted since its last decode step.
++
++    ScheduleBatch.prepare_for_decode returns before cumulate_penalty_output_tokens()
++    for speculative batches; EAGLE feeds the last token itself (a relaxed update),
++    DFlash fed none, so presence/frequency/repetition penalties never saw a
++    generated token. A DFlash step commits up to a block of tokens: feed them all,
++    one position at a time. Set-based penalizers (presence, repetition) take a
++    request's last token again where it has fewer new tokens (idempotent);
++    count-based ones (frequency, min_new_tokens) add only real tokens. Under
++    overlap scheduling the newest tokens arrive a step later, as for EAGLE.
++    """
++    orchestrator = batch.sampling_info.penalizer_orchestrator
++    if orchestrator is None or not orchestrator.is_required:
++        return
++    new_tokens = []
++    for req in batch.reqs:
++        out = req.output_ids
++        fed = min(getattr(req, "_dflash_penalty_fed", 0), len(out))
++        new_tokens.append(list(out[fed:]))
++        req._dflash_penalty_fed = len(out)
++    k = max((len(t) for t in new_tokens), default=0)
++    if k == 0:
++        return
++    ids = torch.zeros((len(new_tokens), k), dtype=torch.int64)
++    valid = torch.zeros((len(new_tokens), k), dtype=torch.bool)
++    for i, (req, toks) in enumerate(zip(batch.reqs, new_tokens)):
++        if toks:
++            ids[i, : len(toks)] = torch.tensor(toks, dtype=torch.int64)
++            ids[i, len(toks) :] = toks[-1]
++            valid[i, : len(toks)] = True
++        else:
++            ids[i, :] = req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
++    ids = ids.to(orchestrator.device, non_blocking=True)
++    valid = valid.to(orchestrator.device, non_blocking=True)
++    for j in range(k):
++        col, real = ids[:, j], valid[:, j].unsqueeze(1)
++        for penalizer in orchestrator.penalizers.values():
++            if not getattr(penalizer, "_is_prepared", False):
++                continue
++            if hasattr(penalizer, "cumulated_frequency_penalties"):
++                penalizer.cumulated_frequency_penalties.scatter_add_(
++                    dim=1, index=col.unsqueeze(1), src=penalizer.frequency_penalties * real
++                )
++            elif hasattr(penalizer, "len_output_tokens"):
++                penalizer.len_output_tokens += real.to(penalizer.len_output_tokens.dtype)
++            else:
++                penalizer.cumulate_output_tokens(output_ids=col)
++
++
+ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
+     """eagle/ngram share a stateless free function; dflash keeps stateful
+     prep on its draft input -- the dispatcher routes.
+@@ -1089,6 +1139,7 @@
+             max_speculative_num_draft_tokens(),
+         )
+     if batch.spec_algorithm.is_dflash_family():
++        _dflash_cumulate_penalties(batch)
+         batch.spec_info.prepare_for_decode(batch)
+     elif batch.spec_algorithm.is_uno():
+         from sglang.srt.speculative.uno_info import UnoDraftInput
